@@ -37,9 +37,13 @@ To get started with the Gerbil project, follow these setup instructions:
 
 4. **Run the Application**:
    To run the application, execute:
-   ```bash
-   ./gerbil
-   ```
+    ```bash
+    ./gerbil \
+    --reachableAt=http://gerbil:3003 \
+    --generateAndSaveKeyTo=/var/config/key \
+    --remoteConfig=http://pangolin:3001/api/v1/gerbil/get-config \
+    --reportBandwidthTo=http://pangolin:3001/api/v1/gerbil/receive-bandwidth
+    ```
 
 ## 2. Project Structure Overview
 
@@ -47,23 +51,15 @@ The project structure of Gerbil is organized as follows:
 
 ```
 gerbil/
-├── .github/
-│   └── PULL_REQUEST_TEMPLATE.md
 ├── logger/
 │   ├── level.go
 │   └── logger.go
-├── .dockerignore
-├── .gitignore
 ├── config_example.json
-├── CONTRIBUTING.md
 ├── Dockerfile
 ├── entrypoint.sh
 ├── go.mod
-├── LICENSE
 ├── main.go
 ├── Makefile
-├── README.md
-└── SECURITY.md
 ```
 
 ### Key Components
@@ -100,41 +96,3 @@ The development workflow for contributing to Gerbil involves several key steps:
 6. **Creating a Pull Request**: Open a pull request against the main branch of the repository.
 
 7. **Code Review**: Participate in code reviews and address any feedback received.
-
-## 4. Testing Approach
-
-The testing approach for Gerbil includes:
-
-- **Unit Tests**: Write unit tests for individual functions and methods to ensure they work as expected.
-- **Integration Tests**: Test interactions between different components of the application.
-- **Running Tests**: Use Go's built-in testing framework to run tests:
-  ```bash
-  go test ./...
-  ```
-
-### Testing Best Practices
-
-- Use descriptive names for test functions.
-- Cover edge cases in your tests.
-- Ensure tests are isolated and do not depend on external systems.
-
-## 5. Common Troubleshooting Steps
-
-If you encounter issues while developing or running the Gerbil project, consider these troubleshooting steps:
-
-1. **Dependency Issues**:
-   - Ensure all dependencies are correctly installed by running `go mod tidy`.
-  
-2. **Build Failures**:
-   - Check for error messages during the build process and resolve any syntax or import errors.
-
-3. **Docker Issues**:
-   - If you encounter issues with Docker, ensure that Docker is running and that you have sufficient permissions to build images.
-
-4. **Configuration Errors**:
-   - Verify that your configuration file (e.g., `config_example.json`) is correctly set up according to your environment needs.
-
-5. **Log Output**:
-   - Check log output for any runtime errors or warnings that may indicate what went wrong.
-
-By following this guide, developers should be able to effectively set up their environment, understand the project structure, contribute to development, test their changes, and troubleshoot common issues in the Gerbil project. If further assistance is needed, refer to the `README.md` file or reach out to other contributors in the community.
