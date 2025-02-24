@@ -40,14 +40,7 @@ The main components of the Gerbil project include:
           v
 +---------+---------+
 |                   |
-|   Main Application|
-|                   |
-+---------+---------+
-          |
-          v
-+---------+---------+
-|                   |
-|      Logger       |
+|       Main        |
 |                   |
 +---------+---------+
           |
@@ -60,7 +53,7 @@ The main components of the Gerbil project include:
 ```
 
 ### Description:
-- **Configuration**: The application reads from a configuration file that specifies settings like private keys, listen ports, and peers.
+- **Configuration**: The application reads from a configuration file or over the API that specifies settings like private keys, listen ports, and peers.
 - **Main Application**: Orchestrates the flow by initializing components and executing commands based on user input.
 - **Logger**: Captures events during execution for later review.
 - **WireGuard API**: Interacts with the underlying WireGuard service to manage VPN tunnels.
@@ -80,12 +73,3 @@ These design choices enhance maintainability, readability, and performance while
 ### Constraints:
 - **Platform Dependency**: The application relies on Linux-based systems due to its use of netlink sockets for network management.
 - **Privileged Operations**: Requires elevated permissions to create network interfaces and modify routing tables.
-  
-### Limitations:
-- **Single-threaded Execution**: While Go supports concurrency, certain operations (like interface creation) may block other operations if not managed correctly.
-- **Error Handling Complexity**: Managing errors from external systems (like WireGuard) can complicate flow control within the application.
-
-### Future Considerations:
-To enhance scalability and resilience, consider implementing asynchronous handling of network operations and improving error recovery mechanisms.
-
-This documentation serves as a foundational reference for developers working on or contributing to the Gerbil project. It provides insights into how components interact within the system architecture while highlighting design decisions that shape its functionality.
