@@ -6,45 +6,33 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/fosrl/gerbil/logger"
-	"github.com/fosrl/gerbil/relay"
-	"github.com/vishvananda/netlink"
-	"golang.zx2c4.com/wireguard/wgctrl"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+	"github.com/hhftechnology/gerbil/logger"
+	"github.com/hhftechnology/gerbil/tailscale"
 )
 
 var (
-	interfaceName string
-	listenAddr    string
-	mtuInt        int
-	lastReadings  = make(map[string]PeerReading)
-	mu            sync.Mutex
-	wgMu          sync.Mutex // Protects WireGuard operations
-	notifyURL     string
-	proxyServer   *relay.UDPProxyServer
+	listenAddr   string
+	lastReadings = make(map[string]PeerReading)
+	mu           sync.Mutex
+	notifyURL    string
+	tsClient     *tailscale.Client
 )
 
-type WgConfig struct {
-	PrivateKey string `json:"privateKey"`
-	ListenPort int    `json:"listenPort"`
-	IpAddress  string `json:"ipAddress"`
-	Peers      []Peer `json:"peers"`
-}
-
-type Peer struct {
-	PublicKey  string   `json:"publicKey"`
-	AllowedIPs []string `json:"allowedIps"`
+type TailscaleConfig struct {
+	AuthKey     string `json:"authKey"`
+	ControlURL  string `json:"controlUrl,omitempty"`
+	Hostname    string `json:"hostname,omitempty"`
+	ExitNode    string `json:"exitNode,omitempty"`
+	AcceptRoutes bool   `json:"acceptRoutes,omitempty"`
 }
 
 type PeerBandwidth struct {
@@ -59,33 +47,12 @@ type PeerReading struct {
 	LastChecked      time.Time
 }
 
-var (
-	wgClient *wgctrl.Client
-)
-
-// Add this new type at the top with other type definitions
-type ClientEndpoint struct {
-	OlmID     string `json:"olmId"`
-	NewtID    string `json:"newtId"`
-	IP        string `json:"ip"`
-	Port      int    `json:"port"`
-	Timestamp int64  `json:"timestamp"`
-}
-
-type HolePunchMessage struct {
-	OlmID  string `json:"olmId"`
-	NewtID string `json:"newtId"`
-}
-
-type ProxyMappingUpdate struct {
-	OldDestination relay.PeerDestination `json:"oldDestination"`
-	NewDestination relay.PeerDestination `json:"newDestination"`
-}
-
-type UpdateDestinationsRequest struct {
-	SourceIP     string                  `json:"sourceIp"`
-	SourcePort   int                     `json:"sourcePort"`
-	Destinations []relay.PeerDestination `json:"destinations"`
+type PeerInfo struct {
+	PublicKey  string   `json:"publicKey"`
+	Hostname   string   `json:"hostname"`
+	IP         string   `json:"ip"`
+	AllowedIPs []string `json:"allowedIps"`
+	Connected  bool     `json:"connected"`
 }
 
 func parseLogLevel(level string) logger.LogLevel {
@@ -101,35 +68,33 @@ func parseLogLevel(level string) logger.LogLevel {
 	case "FATAL":
 		return logger.FATAL
 	default:
-		return logger.INFO // default to INFO if invalid level provided
+		return logger.INFO
 	}
 }
 
 func main() {
 	var (
-		err                  error
-		wgconfig             WgConfig
-		configFile           string
-		remoteConfigURL      string
-		generateAndSaveKeyTo string
-		reachableAt          string
-		logLevel             string
-		mtu                  string
+		err             error
+		tsconfig        TailscaleConfig
+		configFile      string
+		remoteConfigURL string
+		logLevel        string
+		authKey         string
+		hostname        string
+		controlURL      string
 	)
 
-	interfaceName = os.Getenv("INTERFACE")
+	// Environment variables
 	configFile = os.Getenv("CONFIG")
 	remoteConfigURL = os.Getenv("REMOTE_CONFIG")
 	listenAddr = os.Getenv("LISTEN")
-	generateAndSaveKeyTo = os.Getenv("GENERATE_AND_SAVE_KEY_TO")
-	reachableAt = os.Getenv("REACHABLE_AT")
 	logLevel = os.Getenv("LOG_LEVEL")
-	mtu = os.Getenv("MTU")
 	notifyURL = os.Getenv("NOTIFY_URL")
+	authKey = os.Getenv("TAILSCALE_AUTHKEY")
+	hostname = os.Getenv("TAILSCALE_HOSTNAME")
+	controlURL = os.Getenv("TAILSCALE_CONTROL_URL")
 
-	if interfaceName == "" {
-		flag.StringVar(&interfaceName, "interface", "wg0", "Name of the WireGuard interface")
-	}
+	// Command line flags
 	if configFile == "" {
 		flag.StringVar(&configFile, "config", "", "Path to local configuration file")
 	}
@@ -139,136 +104,79 @@ func main() {
 	if listenAddr == "" {
 		flag.StringVar(&listenAddr, "listen", ":3003", "Address to listen on")
 	}
-	// DEPRECATED AND UNSED: reportBandwidthTo
-	// allow reportBandwidthTo to be passed but dont do anything with it just thow it away
-	reportBandwidthTo := ""
-	flag.StringVar(&reportBandwidthTo, "reportBandwidthTo", "", "DEPRECATED: Use remoteConfig instead")
-
-	if generateAndSaveKeyTo == "" {
-		flag.StringVar(&generateAndSaveKeyTo, "generateAndSaveKeyTo", "", "Path to save generated private key")
-	}
-	if reachableAt == "" {
-		flag.StringVar(&reachableAt, "reachableAt", "", "Endpoint of the http server to tell remote config about")
-	}
 	if logLevel == "" {
 		flag.StringVar(&logLevel, "log-level", "INFO", "Log level (DEBUG, INFO, WARN, ERROR, FATAL)")
 	}
-	if mtu == "" {
-		flag.StringVar(&mtu, "mtu", "1280", "MTU of the WireGuard interface")
-	}
 	if notifyURL == "" {
 		flag.StringVar(&notifyURL, "notify", "", "URL to notify on peer changes")
+	}
+	if authKey == "" {
+		flag.StringVar(&authKey, "authkey", "", "Tailscale auth key")
+	}
+	if hostname == "" {
+		flag.StringVar(&hostname, "hostname", "", "Tailscale hostname")
+	}
+	if controlURL == "" {
+		flag.StringVar(&controlURL, "control-url", "", "Tailscale control server URL")
 	}
 	flag.Parse()
 
 	logger.Init()
 	logger.GetLogger().SetLevel(parseLogLevel(logLevel))
 
-	mtuInt, err = strconv.Atoi(mtu)
-	if err != nil {
-		logger.Fatal("Failed to parse MTU: %v", err)
-	}
-
-	// are they missing either the config file or the remote config URL?
-	if configFile == "" && remoteConfigURL == "" {
-		logger.Fatal("You must provide either a config file or a remote config URL")
-	}
-
-	// do they have both the config file and the remote config URL?
-	if configFile != "" && remoteConfigURL != "" {
-		logger.Fatal("You must provide either a config file or a remote config URL, not both")
-	}
-
-	// clean up the reomte config URL for backwards compatibility
+	// Clean up the remote config URL for backwards compatibility
 	remoteConfigURL = strings.TrimSuffix(remoteConfigURL, "/gerbil/get-config")
 	remoteConfigURL = strings.TrimSuffix(remoteConfigURL, "/")
 
-	var key wgtypes.Key
-	// if generateAndSaveKeyTo is provided, generate a private key and save it to the file. if the file already exists, load the key from the file
-	if generateAndSaveKeyTo != "" {
-		if _, err := os.Stat(generateAndSaveKeyTo); os.IsNotExist(err) {
-			// generate a new private key
-			key, err = wgtypes.GeneratePrivateKey()
-			if err != nil {
-				logger.Fatal("Failed to generate private key: %v", err)
-			}
-			// save the key to the file
-			err = os.WriteFile(generateAndSaveKeyTo, []byte(key.String()), 0644)
-			if err != nil {
-				logger.Fatal("Failed to save private key: %v", err)
-			}
-		} else {
-			keyData, err := os.ReadFile(generateAndSaveKeyTo)
-			if err != nil {
-				logger.Fatal("Failed to read private key: %v", err)
-			}
-			key, err = wgtypes.ParseKey(string(keyData))
-			if err != nil {
-				logger.Fatal("Failed to parse private key: %v", err)
-			}
-		}
-	} else {
-		// if no generateAndSaveKeyTo is provided, ensure that the private key is provided
-		if wgconfig.PrivateKey == "" {
-			// generate a new one
-			key, err = wgtypes.GeneratePrivateKey()
-			if err != nil {
-				logger.Fatal("Failed to generate private key: %v", err)
-			}
-		}
-	}
-
 	// Load configuration based on provided argument
 	if configFile != "" {
-		wgconfig, err = loadConfig(configFile)
+		tsconfig, err = loadConfig(configFile)
 		if err != nil {
 			logger.Fatal("Failed to load configuration: %v", err)
 		}
-		if wgconfig.PrivateKey == "" {
-			wgconfig.PrivateKey = key.String()
-		}
-	} else {
-		// loop until we get the config
-		for wgconfig.PrivateKey == "" {
-			logger.Info("Fetching remote config from %s", remoteConfigURL+"/gerbil/get-config")
-			wgconfig, err = loadRemoteConfig(remoteConfigURL+"/gerbil/get-config", key, reachableAt)
+	} else if remoteConfigURL != "" {
+		// Loop until we get the config
+		for tsconfig.AuthKey == "" {
+			logger.Info("Fetching remote config from %s", remoteConfigURL+"/gerbil/get-tailscale-config")
+			tsconfig, err = loadRemoteConfig(remoteConfigURL + "/gerbil/get-tailscale-config")
 			if err != nil {
 				logger.Error("Failed to load configuration: %v", err)
 				time.Sleep(5 * time.Second)
 				continue
 			}
-			wgconfig.PrivateKey = key.String()
+		}
+	} else {
+		// Use environment variables or flags
+		tsconfig = TailscaleConfig{
+			AuthKey:    authKey,
+			ControlURL: controlURL,
+			Hostname:   hostname,
+		}
+		
+		if tsconfig.AuthKey == "" {
+			logger.Fatal("You must provide either a config file, remote config URL, or Tailscale auth key")
 		}
 	}
 
-	wgClient, err = wgctrl.New()
-	if err != nil {
-		logger.Fatal("Failed to create WireGuard client: %v", err)
-	}
-	defer wgClient.Close()
+	// Initialize Tailscale client
+	tsClient = tailscale.NewClient()
 
-	// Ensure the WireGuard interface exists and is configured
-	if err := ensureWireguardInterface(wgconfig); err != nil {
-		logger.Fatal("Failed to ensure WireGuard interface: %v", err)
+	// Ensure Tailscale is running and configured
+	if err := ensureTailscale(tsconfig); err != nil {
+		logger.Fatal("Failed to ensure Tailscale: %v", err)
 	}
 
-	// Ensure the WireGuard peers exist
-	ensureWireguardPeers(wgconfig.Peers)
-
-	go periodicBandwidthCheck(remoteConfigURL + "/gerbil/receive-bandwidth")
-
-	// Start the UDP proxy server
-	proxyServer = relay.NewUDPProxyServer(":21820", remoteConfigURL, key, reachableAt)
-	err = proxyServer.Start()
-	if err != nil {
-		logger.Fatal("Failed to start UDP proxy server: %v", err)
+	// Start periodic bandwidth check
+	if remoteConfigURL != "" {
+		go periodicBandwidthCheck(remoteConfigURL + "/gerbil/receive-bandwidth")
 	}
-	defer proxyServer.Stop()
 
 	// Set up HTTP server
 	http.HandleFunc("/peer", handlePeer)
-	http.HandleFunc("/update-proxy-mapping", handleUpdateProxyMapping)
-	http.HandleFunc("/update-destinations", handleUpdateDestinations)
+	http.HandleFunc("/peers", handleGetPeers)
+	http.HandleFunc("/status", handleStatus)
+	http.HandleFunc("/health", handleHealth)
+	
 	logger.Info("Starting HTTP server on %s", listenAddr)
 
 	// Run HTTP server in a goroutine
@@ -282,573 +190,219 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
-	logger.Info("Shutting down servers...")
+	logger.Info("Shutting down...")
+	
+	// Logout from Tailscale
+	if err := tsClient.Logout(); err != nil {
+		logger.Error("Failed to logout from Tailscale: %v", err)
+	}
 }
 
-func loadRemoteConfig(url string, key wgtypes.Key, reachableAt string) (WgConfig, error) {
-	var body *bytes.Buffer
-	if reachableAt == "" {
-		body = bytes.NewBuffer([]byte(fmt.Sprintf(`{"publicKey": "%s"}`, key.PublicKey().String())))
-	} else {
-		body = bytes.NewBuffer([]byte(fmt.Sprintf(`{"publicKey": "%s", "reachableAt": "%s"}`, key.PublicKey().String(), reachableAt)))
-	}
-	resp, err := http.Post(url, "application/json", body)
+func loadRemoteConfig(url string) (TailscaleConfig, error) {
+	resp, err := http.Get(url)
 	if err != nil {
-		// print the error
 		logger.Error("Error fetching remote config %s: %v", url, err)
-		return WgConfig{}, err
+		return TailscaleConfig{}, err
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return WgConfig{}, err
+		return TailscaleConfig{}, err
 	}
 
-	var config WgConfig
+	var config TailscaleConfig
 	err = json.Unmarshal(data, &config)
-
 	return config, err
 }
 
-func loadConfig(filename string) (WgConfig, error) {
-	// Open the JSON file
+func loadConfig(filename string) (TailscaleConfig, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		logger.Error("Error opening file %s: %v", filename, err)
-		return WgConfig{}, err
+		return TailscaleConfig{}, err
 	}
 	defer file.Close()
 
-	// Read the file contents
 	byteValue, err := io.ReadAll(file)
 	if err != nil {
 		logger.Error("Error reading file %s: %v", filename, err)
-		return WgConfig{}, err
+		return TailscaleConfig{}, err
 	}
 
-	// Create a variable of the appropriate type to hold the unmarshaled data
-	var wgconfig WgConfig
-
-	// Unmarshal the JSON data into the struct
-	err = json.Unmarshal(byteValue, &wgconfig)
+	var tsconfig TailscaleConfig
+	err = json.Unmarshal(byteValue, &tsconfig)
 	if err != nil {
 		logger.Error("Error unmarshaling JSON data: %v", err)
-		return WgConfig{}, err
+		return TailscaleConfig{}, err
 	}
 
-	return wgconfig, nil
+	return tsconfig, nil
 }
 
-func ensureWireguardInterface(wgconfig WgConfig) error {
-	// Check if the WireGuard interface exists
-	_, err := netlink.LinkByName(interfaceName)
-	if err != nil {
-		if _, ok := err.(netlink.LinkNotFoundError); ok {
-			// Interface doesn't exist, so create it
-			err = createWireGuardInterface()
-			if err != nil {
-				logger.Fatal("Failed to create WireGuard interface: %v", err)
-			}
-			logger.Info("Created WireGuard interface %s\n", interfaceName)
-		} else {
-			logger.Fatal("Error checking for WireGuard interface: %v", err)
+func ensureTailscale(config TailscaleConfig) error {
+	// Check if tailscaled is running
+	if !isTailscaleDaemonRunning() {
+		logger.Info("Starting tailscaled daemon...")
+		if err := startTailscaleDaemon(); err != nil {
+			return fmt.Errorf("failed to start tailscaled: %v", err)
 		}
+		// Wait for daemon to be ready
+		time.Sleep(3 * time.Second)
+	}
+
+	// Check current status
+	status, err := tsClient.Status()
+	if err != nil {
+		return fmt.Errorf("failed to get Tailscale status: %v", err)
+	}
+
+	// If not logged in, use the auth key to join the network
+	if !status.LoggedIn {
+		logger.Info("Logging into Tailscale...")
+		
+		args := []string{"up", "--authkey", config.AuthKey}
+		
+		if config.Hostname != "" {
+			args = append(args, "--hostname", config.Hostname)
+		}
+		
+		if config.ControlURL != "" {
+			args = append(args, "--login-server", config.ControlURL)
+		}
+		
+		if config.AcceptRoutes {
+			args = append(args, "--accept-routes")
+		}
+		
+		if config.ExitNode != "" {
+			args = append(args, "--exit-node", config.ExitNode)
+		}
+		
+		cmd := exec.Command("tailscale", args...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to login to Tailscale: %v, output: %s", err, string(output))
+		}
+		
+		logger.Info("Successfully logged into Tailscale")
+		
+		// Wait for connection to establish
+		time.Sleep(5 * time.Second)
 	} else {
-		logger.Info("WireGuard interface %s already exists\n", interfaceName)
-		return nil
+		logger.Info("Already logged into Tailscale")
 	}
 
-	// Assign IP address to the interface
-	err = assignIPAddress(wgconfig.IpAddress)
+	// Verify we're connected
+	status, err = tsClient.Status()
 	if err != nil {
-		logger.Fatal("Failed to assign IP address: %v", err)
-	}
-	logger.Info("Assigned IP address %s to interface %s\n", wgconfig.IpAddress, interfaceName)
-
-	// Check if the interface already exists
-	_, err = wgClient.Device(interfaceName)
-	if err != nil {
-		return fmt.Errorf("interface %s does not exist", interfaceName)
+		return fmt.Errorf("failed to verify Tailscale status: %v", err)
 	}
 
-	// Parse the private key
-	key, err := wgtypes.ParseKey(wgconfig.PrivateKey)
-	if err != nil {
-		return fmt.Errorf("failed to parse private key: %v", err)
-	}
-
-	// Create a new WireGuard configuration
-	config := wgtypes.Config{
-		PrivateKey: &key,
-		ListenPort: new(int),
-	}
-	*config.ListenPort = wgconfig.ListenPort
-
-	// Create and configure the WireGuard interface
-	err = wgClient.ConfigureDevice(interfaceName, config)
-	if err != nil {
-		return fmt.Errorf("failed to configure WireGuard device: %v", err)
-	}
-
-	// bring up the interface
-	link, err := netlink.LinkByName(interfaceName)
-	if err != nil {
-		return fmt.Errorf("failed to get interface: %v", err)
-	}
-
-	if err := netlink.LinkSetMTU(link, mtuInt); err != nil {
-		return fmt.Errorf("failed to set MTU: %v", err)
-	}
-
-	if err := netlink.LinkSetUp(link); err != nil {
-		return fmt.Errorf("failed to bring up interface: %v", err)
-	}
-
-	if err := ensureMSSClamping(); err != nil {
-		logger.Warn("Failed to ensure MSS clamping: %v", err)
-	}
-
-	logger.Info("WireGuard interface %s created and configured", interfaceName)
-
-	return nil
-}
-
-func createWireGuardInterface() error {
-	wgLink := &netlink.GenericLink{
-		LinkAttrs: netlink.LinkAttrs{Name: interfaceName},
-		LinkType:  "wireguard",
-	}
-	return netlink.LinkAdd(wgLink)
-}
-
-func assignIPAddress(ipAddress string) error {
-	link, err := netlink.LinkByName(interfaceName)
-	if err != nil {
-		return fmt.Errorf("failed to get interface: %v", err)
-	}
-
-	addr, err := netlink.ParseAddr(ipAddress)
-	if err != nil {
-		return fmt.Errorf("failed to parse IP address: %v", err)
-	}
-
-	return netlink.AddrAdd(link, addr)
-}
-
-func ensureWireguardPeers(peers []Peer) error {
-	wgMu.Lock()
-	defer wgMu.Unlock()
-
-	// get the current peers
-	device, err := wgClient.Device(interfaceName)
-	if err != nil {
-		return fmt.Errorf("failed to get device: %v", err)
-	}
-
-	// get the peer public keys
-	var currentPeers []string
-	for _, peer := range device.Peers {
-		currentPeers = append(currentPeers, peer.PublicKey.String())
-	}
-
-	// remove any peers that are not in the config
-	for _, peer := range currentPeers {
-		found := false
-		for _, configPeer := range peers {
-			if peer == configPeer.PublicKey {
-				found = true
-				break
-			}
-		}
-		if !found {
-			// Note: We need to call the internal removal logic without re-acquiring the lock
-			if err := removePeerInternal(peer); err != nil {
-				return fmt.Errorf("failed to remove peer: %v", err)
-			}
-		}
-	}
-
-	// add any peers that are in the config but not in the current peers
-	for _, configPeer := range peers {
-		found := false
-		for _, peer := range currentPeers {
-			if configPeer.PublicKey == peer {
-				found = true
-				break
-			}
-		}
-		if !found {
-			// Note: We need to call the internal addition logic without re-acquiring the lock
-			if err := addPeerInternal(configPeer); err != nil {
-				return fmt.Errorf("failed to add peer: %v", err)
-			}
-		}
+	if status.Self != nil {
+		logger.Info("Tailscale connected as %s with IP %s", status.Self.Hostname, status.Self.TailscaleIPs)
 	}
 
 	return nil
 }
 
-func ensureMSSClamping() error {
-	// Calculate MSS value (MTU - 40 for IPv4 header (20) and TCP header (20))
-	mssValue := mtuInt - 40
+func isTailscaleDaemonRunning() bool {
+	cmd := exec.Command("tailscale", "status", "--json")
+	err := cmd.Run()
+	return err == nil
+}
 
-	// Rules to be managed - just the chains, we'll construct the full command separately
-	chains := []string{"INPUT", "OUTPUT", "FORWARD"}
-
-	// First, try to delete any existing rules
-	for _, chain := range chains {
-		deleteCmd := exec.Command("/usr/sbin/iptables",
-			"-t", "mangle",
-			"-D", chain,
-			"-p", "tcp",
-			"--tcp-flags", "SYN,RST", "SYN",
-			"-j", "TCPMSS",
-			"--set-mss", fmt.Sprintf("%d", mssValue))
-
-		logger.Info("Attempting to delete existing MSS clamping rule for chain %s", chain)
-
-		// Try deletion multiple times to handle multiple existing rules
-		for i := 0; i < 3; i++ {
-			out, err := deleteCmd.CombinedOutput()
-			if err != nil {
-				// Convert exit status 1 to string for better logging
-				if exitErr, ok := err.(*exec.ExitError); ok {
-					logger.Debug("Deletion stopped for chain %s: %v (output: %s)",
-						chain, exitErr.String(), string(out))
-				}
-				break // No more rules to delete
-			}
-			logger.Info("Deleted MSS clamping rule for chain %s (attempt %d)", chain, i+1)
+func startTailscaleDaemon() error {
+	// Try to start tailscaled in the background
+	cmd := exec.Command("tailscaled", "--state=/var/lib/tailscale/tailscaled.state", "--socket=/var/run/tailscale/tailscaled.sock")
+	if err := cmd.Start(); err != nil {
+		// If that fails, try using systemctl
+		cmd = exec.Command("systemctl", "start", "tailscaled")
+		if err := cmd.Run(); err != nil {
+			// If that also fails, try service command
+			cmd = exec.Command("service", "tailscaled", "start")
+			return cmd.Run()
 		}
 	}
-
-	// Then add the new rules
-	var errors []error
-	for _, chain := range chains {
-		addCmd := exec.Command("/usr/sbin/iptables",
-			"-t", "mangle",
-			"-A", chain,
-			"-p", "tcp",
-			"--tcp-flags", "SYN,RST", "SYN",
-			"-j", "TCPMSS",
-			"--set-mss", fmt.Sprintf("%d", mssValue))
-
-		logger.Info("Adding MSS clamping rule for chain %s", chain)
-
-		if out, err := addCmd.CombinedOutput(); err != nil {
-			errMsg := fmt.Sprintf("Failed to add MSS clamping rule for chain %s: %v (output: %s)",
-				chain, err, string(out))
-			logger.Error(errMsg)
-			errors = append(errors, fmt.Errorf("%s", errMsg))
-			continue
-		}
-
-		// Verify the rule was added
-		checkCmd := exec.Command("/usr/sbin/iptables",
-			"-t", "mangle",
-			"-C", chain,
-			"-p", "tcp",
-			"--tcp-flags", "SYN,RST", "SYN",
-			"-j", "TCPMSS",
-			"--set-mss", fmt.Sprintf("%d", mssValue))
-
-		if out, err := checkCmd.CombinedOutput(); err != nil {
-			errMsg := fmt.Sprintf("Rule verification failed for chain %s: %v (output: %s)",
-				chain, err, string(out))
-			logger.Error(errMsg)
-			errors = append(errors, fmt.Errorf("%s", errMsg))
-			continue
-		}
-
-		logger.Info("Successfully added and verified MSS clamping rule for chain %s", chain)
-	}
-
-	// If we encountered any errors, return them combined
-	if len(errors) > 0 {
-		var errMsgs []string
-		for _, err := range errors {
-			errMsgs = append(errMsgs, err.Error())
-		}
-		return fmt.Errorf("MSS clamping setup encountered errors:\n%s",
-			strings.Join(errMsgs, "\n"))
-	}
-
 	return nil
 }
 
 func handlePeer(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
+	case http.MethodGet:
+		handleGetPeers(w, r)
 	case http.MethodPost:
-		handleAddPeer(w, r)
+		// Tailscale peers are managed by the control plane
+		// We can't add peers directly
+		http.Error(w, "Peers are managed by Tailscale control plane", http.StatusNotImplemented)
 	case http.MethodDelete:
-		handleRemovePeer(w, r)
+		// Tailscale peers are managed by the control plane
+		// We can't remove peers directly
+		http.Error(w, "Peers are managed by Tailscale control plane", http.StatusNotImplemented)
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-func handleAddPeer(w http.ResponseWriter, r *http.Request) {
-	var peer Peer
-	if err := json.NewDecoder(r.Body).Decode(&peer); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+func handleGetPeers(w http.ResponseWriter, r *http.Request) {
+	status, err := tsClient.Status()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get Tailscale status: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	err := addPeer(peer)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Notify if notifyURL is set
-	go notifyPeerChange("add", peer.PublicKey)
-
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{"status": "Peer added successfully"})
-}
-
-func addPeer(peer Peer) error {
-	wgMu.Lock()
-	defer wgMu.Unlock()
-	return addPeerInternal(peer)
-}
-
-func addPeerInternal(peer Peer) error {
-	pubKey, err := wgtypes.ParseKey(peer.PublicKey)
-	if err != nil {
-		return fmt.Errorf("failed to parse public key: %v", err)
-	}
-
-	// parse allowed IPs into array of net.IPNet
-	var allowedIPs []net.IPNet
-	var wgIPs []string
-	for _, ipStr := range peer.AllowedIPs {
-		_, ipNet, err := net.ParseCIDR(ipStr)
-		if err != nil {
-			return fmt.Errorf("failed to parse allowed IP: %v", err)
+	var peers []PeerInfo
+	for _, peer := range status.Peers {
+		peerInfo := PeerInfo{
+			PublicKey:  peer.PublicKey,
+			Hostname:   peer.Hostname,
+			IP:         peer.TailscaleIPs,
+			AllowedIPs: peer.AllowedIPs,
+			Connected:  peer.Online,
 		}
-		allowedIPs = append(allowedIPs, *ipNet)
-		// Extract the IP address from the CIDR for relay cleanup
-		wgIPs = append(wgIPs, ipNet.IP.String())
+		peers = append(peers, peerInfo)
 	}
 
-	peerConfig := wgtypes.PeerConfig{
-		PublicKey:  pubKey,
-		AllowedIPs: allowedIPs,
-	}
-
-	config := wgtypes.Config{
-		Peers: []wgtypes.PeerConfig{peerConfig},
-	}
-
-	if err := wgClient.ConfigureDevice(interfaceName, config); err != nil {
-		return fmt.Errorf("failed to add peer: %v", err)
-	}
-
-	// Clear relay connections for the peer's WireGuard IPs
-	if proxyServer != nil {
-		for _, wgIP := range wgIPs {
-			proxyServer.OnPeerAdded(wgIP)
-		}
-	}
-
-	logger.Info("Peer %s added successfully", peer.PublicKey)
-
-	return nil
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(peers)
 }
 
-func handleRemovePeer(w http.ResponseWriter, r *http.Request) {
-	publicKey := r.URL.Query().Get("public_key")
-	if publicKey == "" {
-		http.Error(w, "Missing public_key query parameter", http.StatusBadRequest)
-		return
-	}
-
-	err := removePeer(publicKey)
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	status, err := tsClient.Status()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Failed to get Tailscale status: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Notify if notifyURL is set
-	go notifyPeerChange("remove", publicKey)
+	response := map[string]interface{}{
+		"loggedIn": status.LoggedIn,
+		"self": map[string]interface{}{
+			"hostname":      status.Self.Hostname,
+			"tailscaleIPs":  status.Self.TailscaleIPs,
+			"publicKey":     status.Self.PublicKey,
+			"online":        status.Self.Online,
+		},
+		"peerCount": len(status.Peers),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	status, err := tsClient.Status()
+	if err != nil {
+		http.Error(w, "Unhealthy", http.StatusServiceUnavailable)
+		return
+	}
+
+	if !status.LoggedIn {
+		http.Error(w, "Not logged in", http.StatusServiceUnavailable)
+		return
+	}
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "Peer removed successfully"})
-}
-
-func removePeer(publicKey string) error {
-	wgMu.Lock()
-	defer wgMu.Unlock()
-	return removePeerInternal(publicKey)
-}
-
-func removePeerInternal(publicKey string) error {
-	pubKey, err := wgtypes.ParseKey(publicKey)
-	if err != nil {
-		return fmt.Errorf("failed to parse public key: %v", err)
-	}
-
-	// Get current peer info before removing to clear relay connections
-	var wgIPs []string
-	if proxyServer != nil {
-		device, err := wgClient.Device(interfaceName)
-		if err == nil {
-			for _, peer := range device.Peers {
-				if peer.PublicKey.String() == publicKey {
-					// Extract WireGuard IPs from this peer's allowed IPs
-					for _, allowedIP := range peer.AllowedIPs {
-						wgIPs = append(wgIPs, allowedIP.IP.String())
-					}
-					break
-				}
-			}
-		}
-	}
-
-	peerConfig := wgtypes.PeerConfig{
-		PublicKey: pubKey,
-		Remove:    true,
-	}
-
-	config := wgtypes.Config{
-		Peers: []wgtypes.PeerConfig{peerConfig},
-	}
-
-	if err := wgClient.ConfigureDevice(interfaceName, config); err != nil {
-		return fmt.Errorf("failed to remove peer: %v", err)
-	}
-
-	// Clear relay connections for the peer's WireGuard IPs
-	if proxyServer != nil {
-		for _, wgIP := range wgIPs {
-			proxyServer.OnPeerRemoved(wgIP)
-		}
-	}
-
-	logger.Info("Peer %s removed successfully", publicKey)
-
-	return nil
-}
-
-func handleUpdateProxyMapping(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		logger.Error("Invalid method: %s", r.Method)
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var update ProxyMappingUpdate
-	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
-		logger.Error("Failed to decode request body: %v", err)
-		http.Error(w, fmt.Sprintf("Failed to decode request body: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	// Validate the update request
-	if update.OldDestination.DestinationIP == "" || update.NewDestination.DestinationIP == "" {
-		logger.Error("Both old and new destination IP addresses are required")
-		http.Error(w, "Both old and new destination IP addresses are required", http.StatusBadRequest)
-		return
-	}
-
-	if update.OldDestination.DestinationPort <= 0 || update.NewDestination.DestinationPort <= 0 {
-		logger.Error("Both old and new destination ports must be positive integers")
-		http.Error(w, "Both old and new destination ports must be positive integers", http.StatusBadRequest)
-		return
-	}
-
-	// Update the proxy mappings in the relay server
-	if proxyServer == nil {
-		logger.Error("Proxy server is not available")
-		http.Error(w, "Proxy server is not available", http.StatusInternalServerError)
-		return
-	}
-
-	updatedCount := proxyServer.UpdateDestinationInMappings(update.OldDestination, update.NewDestination)
-
-	logger.Info("Updated %d proxy mappings: %s:%d -> %s:%d",
-		updatedCount,
-		update.OldDestination.DestinationIP, update.OldDestination.DestinationPort,
-		update.NewDestination.DestinationIP, update.NewDestination.DestinationPort)
-
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":         "Proxy mappings updated successfully",
-		"updatedCount":   updatedCount,
-		"oldDestination": update.OldDestination,
-		"newDestination": update.NewDestination,
-	})
-}
-
-func handleUpdateDestinations(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		logger.Error("Invalid method: %s", r.Method)
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var request UpdateDestinationsRequest
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		logger.Error("Failed to decode request body: %v", err)
-		http.Error(w, fmt.Sprintf("Failed to decode request body: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	// Validate the request
-	if request.SourceIP == "" {
-		logger.Error("Source IP address is required")
-		http.Error(w, "Source IP address is required", http.StatusBadRequest)
-		return
-	}
-
-	if request.SourcePort <= 0 {
-		logger.Error("Source port must be a positive integer")
-		http.Error(w, "Source port must be a positive integer", http.StatusBadRequest)
-		return
-	}
-
-	if len(request.Destinations) == 0 {
-		logger.Error("At least one destination is required")
-		http.Error(w, "At least one destination is required", http.StatusBadRequest)
-		return
-	}
-
-	// Validate each destination
-	for i, dest := range request.Destinations {
-		if dest.DestinationIP == "" {
-			logger.Error("Destination IP is required for destination %d", i)
-			http.Error(w, fmt.Sprintf("Destination IP is required for destination %d", i), http.StatusBadRequest)
-			return
-		}
-		if dest.DestinationPort <= 0 {
-			logger.Error("Destination port must be a positive integer for destination %d", i)
-			http.Error(w, fmt.Sprintf("Destination port must be a positive integer for destination %d", i), http.StatusBadRequest)
-			return
-		}
-	}
-
-	// Update the proxy mappings in the relay server
-	if proxyServer == nil {
-		logger.Error("Proxy server is not available")
-		http.Error(w, "Proxy server is not available", http.StatusInternalServerError)
-		return
-	}
-
-	proxyServer.UpdateProxyMapping(request.SourceIP, request.SourcePort, request.Destinations)
-
-	logger.Info("Updated proxy mapping for %s:%d with %d destinations",
-		request.SourceIP, request.SourcePort, len(request.Destinations))
-
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":           "Destinations updated successfully",
-		"sourceIP":         request.SourceIP,
-		"sourcePort":       request.SourcePort,
-		"destinationCount": len(request.Destinations),
-		"destinations":     request.Destinations,
-	})
+	w.Write([]byte("OK"))
 }
 
 func periodicBandwidthCheck(endpoint string) {
@@ -863,12 +417,9 @@ func periodicBandwidthCheck(endpoint string) {
 }
 
 func calculatePeerBandwidth() ([]PeerBandwidth, error) {
-	wgMu.Lock()
-	device, err := wgClient.Device(interfaceName)
-	wgMu.Unlock()
-
+	status, err := tsClient.Status()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get device: %v", err)
+		return nil, fmt.Errorf("failed to get Tailscale status: %v", err)
 	}
 
 	peerBandwidths := []PeerBandwidth{}
@@ -877,11 +428,15 @@ func calculatePeerBandwidth() ([]PeerBandwidth, error) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	for _, peer := range device.Peers {
-		publicKey := peer.PublicKey.String()
+	for _, peer := range status.Peers {
+		publicKey := peer.PublicKey
+		
+		// Get current traffic stats from Tailscale
+		rxBytes, txBytes := tsClient.GetPeerTraffic(peer.PublicKey)
+		
 		currentReading := PeerReading{
-			BytesReceived:    peer.ReceiveBytes,
-			BytesTransmitted: peer.TransmitBytes,
+			BytesReceived:    rxBytes,
+			BytesTransmitted: txBytes,
 			LastChecked:      now,
 		}
 
@@ -895,7 +450,7 @@ func calculatePeerBandwidth() ([]PeerBandwidth, error) {
 				bytesInDiff = float64(currentReading.BytesReceived - lastReading.BytesReceived)
 				bytesOutDiff = float64(currentReading.BytesTransmitted - lastReading.BytesTransmitted)
 
-				// Handle counter wraparound (if the counter resets or overflows)
+				// Handle counter wraparound
 				if bytesInDiff < 0 {
 					bytesInDiff = float64(currentReading.BytesReceived)
 				}
@@ -912,16 +467,9 @@ func calculatePeerBandwidth() ([]PeerBandwidth, error) {
 					BytesIn:   bytesInMB,
 					BytesOut:  bytesOutMB,
 				})
-			} else {
-				// If readings are too close together or time hasn't passed, report 0
-				peerBandwidths = append(peerBandwidths, PeerBandwidth{
-					PublicKey: publicKey,
-					BytesIn:   0,
-					BytesOut:  0,
-				})
 			}
 		} else {
-			// For first reading of a peer, report 0 to establish baseline
+			// First reading of a peer
 			peerBandwidths = append(peerBandwidths, PeerBandwidth{
 				PublicKey: publicKey,
 				BytesIn:   0,
@@ -934,15 +482,13 @@ func calculatePeerBandwidth() ([]PeerBandwidth, error) {
 	}
 
 	// Clean up old peers
+	currentPeerKeys := make(map[string]bool)
+	for _, peer := range status.Peers {
+		currentPeerKeys[peer.PublicKey] = true
+	}
+	
 	for publicKey := range lastReadings {
-		found := false
-		for _, peer := range device.Peers {
-			if peer.PublicKey.String() == publicKey {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !currentPeerKeys[publicKey] {
 			delete(lastReadings, publicKey)
 		}
 	}
@@ -974,26 +520,30 @@ func reportPeerBandwidth(apiURL string) error {
 	return nil
 }
 
-// notifyPeerChange sends a POST request to notifyURL with the action and public key.
+// notifyPeerChange sends a notification about peer changes
 func notifyPeerChange(action, publicKey string) {
 	if notifyURL == "" {
 		return
 	}
+	
 	payload := map[string]string{
 		"action":    action,
 		"publicKey": publicKey,
 	}
+	
 	data, err := json.Marshal(payload)
 	if err != nil {
 		logger.Warn("Failed to marshal notify payload: %v", err)
 		return
 	}
+	
 	resp, err := http.Post(notifyURL, "application/json", bytes.NewBuffer(data))
 	if err != nil {
 		logger.Warn("Failed to notify peer change: %v", err)
 		return
 	}
 	defer resp.Body.Close()
+	
 	if resp.StatusCode != http.StatusOK {
 		logger.Warn("Notify server returned non-OK: %s", resp.Status)
 	}

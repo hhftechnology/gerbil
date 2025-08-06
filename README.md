@@ -6,7 +6,7 @@ Gerbil is a simple [WireGuard](https://www.wireguard.com/) interface management 
 
 Gerbil works with Pangolin, Newt, and Olm as part of the larger system. See documentation below:
 
--   [Full Documentation](https://docs.fossorial.io)
+- [Full Documentation](https://docs.fossorial.io)
 
 ## Key Functions
 
@@ -24,7 +24,7 @@ Bytes transmitted in and out of each peer are collected every 10 seconds, and in
 
 ### Handle client relaying
 
-Gerbil listens on port 21820 for incoming UDP hole punch packets to orchestrate NAT hole punching between olm and newt clients. Additionally, it handles relaying data through the gerbil server down to the newt. This is accomplished by scanning each packet for headers and handling them appropriately.   
+Gerbil listens on port 21820 for incoming UDP hole punch packets to orchestrate NAT hole punching between olm and newt clients. Additionally, it handles relaying data through the gerbil server down to the newt. This is accomplished by scanning each packet for headers and handling them appropriately.
 
 ## CLI Args
 
@@ -69,7 +69,7 @@ Example:
 ```yaml
 services:
   gerbil:
-    image: fosrl/gerbil
+    image: hhftechnology/gerbil
     container_name: gerbil
     restart: unless-stopped
     command:
@@ -89,7 +89,7 @@ services:
 
 ## Build
 
-### Container 
+### Container
 
 Ensure Docker is installed.
 

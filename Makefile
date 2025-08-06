@@ -6,14 +6,14 @@ docker-build-release:
 		echo "Error: tag is required. Usage: make docker-build-release tag=<tag>"; \
 		exit 1; \
 	fi
-	docker buildx build --platform linux/arm64,linux/amd64 -t fosrl/gerbil:latest -f Dockerfile --push .
-	docker buildx build --platform linux/arm64,linux/amd64 -t fosrl/gerbil:$(tag) -f Dockerfile --push .
+	docker buildx build --platform linux/arm64,linux/amd64 -t hhftechnology/gerbil:latest -f Dockerfile --push .
+	docker buildx build --platform linux/arm64,linux/amd64 -t hhftechnology/gerbil:$(tag) -f Dockerfile --push .
 
 build:
-	docker build -t fosrl/gerbil:latest .
+	docker build -t hhftechnology/gerbil:latest .
 
 push:
-	docker push fosrl/gerbil:latest
+	docker push hhftechnology/gerbil:latest
 
 test:
 	docker run -it -p 3002:3002 -v ./config_example.json:/config/config.json --cap-add=NET_ADMIN --cap-add=SYS_MODULE gerbil --config /config/config.json
